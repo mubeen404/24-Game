@@ -127,11 +127,3 @@ java -cp "bin:lib/mysql-connector-j-8.0.31.jar:glassfish5/mq/lib/jms.jar:glassfi
 - The leaderboard and profile are always up-to-date and reflect the latest database state.
 
 
----
-
-## Contact
-
-For any issues, please contact:
-`Muhammad Mubeen  <mubeenali435@gmail.com>`
-
----
