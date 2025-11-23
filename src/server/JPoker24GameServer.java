@@ -4,6 +4,7 @@ import javax.jms.*;
 import javax.naming.Context;
 import javax.naming.InitialContext;
 import java.util.*;
+import java.util.stream.Collectors;
 import java.util.concurrent.*;
 import common.JoinGameRequest;
 import common.GameStartNotification;
@@ -20,6 +21,11 @@ import common.LeaderboardRequest;
 import common.LeaderboardResponse;
 import common.UserStatsRequest;
 import common.UserStatsResponse;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
 
 public class JPoker24GameServer {
     private static final int MAX_PLAYERS = 4;
@@ -31,6 +37,15 @@ public class JPoker24GameServer {
     private ScheduledFuture<?> timerFuture = null;
     private ScheduledFuture<?> answerTimeoutFuture = null;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+    // Kafka analytics producer
+    private Producer<String, String> analyticsProducer;
+    private static final String KAFKA_TOPIC = "game-analytics";
+
+    // Redis pool
+    private JedisPool jedisPool = new JedisPool(System.getProperty("REDIS_HOST", "localhost"), Integer.parseInt(System.getProperty("REDIS_PORT", "6379")));
+    private static final String REDIS_LEADERBOARD_KEY = "leaderboard:zset";
+    private static final String REDIS_STATS_PREFIX = "userstats:";
 
     private Session session;
     private MessageProducer topicProducer;
@@ -52,6 +67,11 @@ public class JPoker24GameServer {
 
     public void run() throws Exception {
         Properties props = new Properties();
+        initKafkaProducer();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (analyticsProducer != null) analyticsProducer.close();
+            if (jedisPool != null) jedisPool.close();
+        }));
         props.setProperty(Context.INITIAL_CONTEXT_FACTORY, "com.sun.enterprise.naming.SerialInitContextFactory");
         props.setProperty(Context.PROVIDER_URL, "iiop://localhost:3700");
         Context ctx = new InitialContext(props);
@@ -88,6 +108,20 @@ public class JPoker24GameServer {
                     handleAnswerSubmission((AnswerSubmission) obj);
                 }
             }
+        }
+    }
+    private void initKafkaProducer() {
+        try {
+            Properties kafkaProps = new Properties();
+            kafkaProps.put("bootstrap.servers", System.getProperty("KAFKA_BOOTSTRAP", "localhost:9092"));
+            kafkaProps.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+            kafkaProps.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+            kafkaProps.put("acks", "all");
+            analyticsProducer = new KafkaProducer<>(kafkaProps);
+            System.out.println("[Server] Kafka Producer initialized.");
+        } catch (Exception ex) {
+            System.err.println("[Server] Failed to initialize Kafka producer: " + ex.getMessage());
+            analyticsProducer = null; // Keep the server running even if Kafka is down
         }
     }
 
@@ -304,9 +338,55 @@ public class JPoker24GameServer {
                 ps.executeBatch();
             }
             conn.commit();
+            publishAnalyticsEvent(results);
+            updateRedisCaches(results);
         } catch (SQLException e) {
             System.err.println("[Server] DB persistence error: " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+
+    private void updateRedisCaches(Map<String, Boolean> results) {
+        try (Jedis jedis = jedisPool.getResource()) {
+            long durationMs = Math.max(0, System.currentTimeMillis() - currentGameStartTime);
+            for (Map.Entry<String, Boolean> entry : results.entrySet()) {
+                String username = entry.getKey();
+                boolean won = entry.getValue();
+                String statsKey = REDIS_STATS_PREFIX + username;
+
+                jedis.hincrBy(statsKey, "games_played", 1);
+                if (won) {
+                    jedis.hincrBy(statsKey, "games_won", 1);
+                    jedis.hincrBy(statsKey, "total_time_ms", durationMs);
+                    jedis.zincrby(REDIS_LEADERBOARD_KEY, 1, username);
+                }
+            }
+        } catch (Exception ex) {
+            System.err.println("[Server] Redis update failed: " + ex.getMessage());
+        }
+    }
+
+    private void publishAnalyticsEvent(Map<String, Boolean> results) {
+        if (analyticsProducer == null) {
+            return;
+        }
+        try {
+            String winner = gameWinner != null ? gameWinner : "None";
+            long durationMs = Math.max(0, System.currentTimeMillis() - currentGameStartTime);
+            String playersJson = results.entrySet().stream()
+                    .map(e -> String.format("{\"username\":\"%s\",\"won\":%s}", e.getKey(), e.getValue()))
+                    .collect(Collectors.joining(",", "[", "]"));
+            String payload = String.format(
+                    "{\"event_type\":\"GAME_FINISHED\",\"winner\":\"%s\",\"duration_ms\":%d,\"players\":%s,\"timestamp\":%d}",
+                    winner,
+                    durationMs,
+                    playersJson,
+                    System.currentTimeMillis()
+            );
+            analyticsProducer.send(new ProducerRecord<>(KAFKA_TOPIC, winner, payload));
+            System.out.println("[Server] Sent analytics event to Kafka: " + payload);
+        } catch (Exception ex) {
+            System.err.println("[Server] Failed to publish analytics event: " + ex.getMessage());
         }
     }
 
@@ -350,6 +430,10 @@ public class JPoker24GameServer {
 
     // Query leaderboard from DB
     private List<UserStats> getLeaderboardFromDB() {
+        List<UserStats> cached = fetchLeaderboardFromRedis();
+        if (!cached.isEmpty()) {
+            return cached;
+        }
         List<UserStats> stats = new ArrayList<>();
         String sql = "SELECT username, games_played, games_won, " +
                      "CASE WHEN games_won > 0 THEN total_time / games_won / 1000 ELSE 0 END AS avg_time " +
@@ -371,8 +455,33 @@ public class JPoker24GameServer {
         return stats;
     }
 
+    private List<UserStats> fetchLeaderboardFromRedis() {
+        List<UserStats> result = new ArrayList<>();
+        try (Jedis jedis = jedisPool.getResource()) {
+            List<String> topUsers = jedis.zrevrange(REDIS_LEADERBOARD_KEY, 0, 9);
+            int rank = 1;
+            for (String username : topUsers) {
+                double score = jedis.zscore(REDIS_LEADERBOARD_KEY, username);
+                Map<String, String> statsMap = jedis.hgetAll(REDIS_STATS_PREFIX + username);
+                int gamesPlayed = Integer.parseInt(statsMap.getOrDefault("games_played", "0"));
+                int gamesWon = Integer.parseInt(statsMap.getOrDefault("games_won", "0"));
+                long totalTime = Long.parseLong(statsMap.getOrDefault("total_time_ms", "0"));
+                double avgTime = (gamesWon > 0) ? (totalTime / 1000.0 / gamesWon) : 0.0;
+                result.add(new UserStats(username, gamesPlayed, gamesWon, avgTime, rank++));
+            }
+        } catch (Exception ex) {
+            System.err.println("[Server] Redis leaderboard lookup failed: " + ex.getMessage());
+        }
+        return result;
+    }
+
+
     // Query a single user's stats from DB
     private UserStats getUserStatsFromDB(String username) {
+        UserStats cached = fetchUserStatsFromRedis(username);
+        if (cached != null) {
+            return cached;
+        }
         String sql = "SELECT username, games_played, games_won, CASE WHEN games_won > 0 THEN total_time / games_won / 1000 ELSE 0 END AS avg_time FROM user_stats WHERE username = ?";
         try (java.sql.Connection conn = DBUtil.getConnection();
              java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -391,4 +500,23 @@ public class JPoker24GameServer {
         }
         return new UserStats(username, 0, 0, 0.0, 0);
     }
+
+    private UserStats fetchUserStatsFromRedis(String username) {
+        try (Jedis jedis = jedisPool.getResource()) {
+            Map<String, String> statsMap = jedis.hgetAll(REDIS_STATS_PREFIX + username);
+            if (!statsMap.isEmpty()) {
+                int gamesPlayed = Integer.parseInt(statsMap.getOrDefault("games_played", "0"));
+                int gamesWon = Integer.parseInt(statsMap.getOrDefault("games_won", "0"));
+                long totalTime = Long.parseLong(statsMap.getOrDefault("total_time_ms", "0"));
+                double avgTime = (gamesWon > 0) ? (totalTime / 1000.0 / gamesWon) : 0.0;
+                Double rankScore = jedis.zscore(REDIS_LEADERBOARD_KEY, username);
+                int rank = rankScore != null ? (int) rankScore.doubleValue() : 0;
+                return new UserStats(username, gamesPlayed, gamesWon, avgTime, rank);
+            }
+        } catch (Exception ex) {
+            System.err.println("[Server] Redis user stats lookup failed: " + ex.getMessage());
+        }
+        return null;
+    }
+
 } 
